@@ -7,6 +7,7 @@ from pathlib import Path
 from textwrap import wrap
 
 from russian_stemmer import stem
+from thesaurus import expansions
 
 
 KNOWLEDGE_BASE = Path(__file__).resolve().parent / "materials/knowledge-base"
@@ -88,6 +89,18 @@ def tokens(text):
     ]
 
 
+def term_aliases(text):
+    """stem -> {stem, strong thesaurus synonyms of that word}."""
+    normalized = SIM_CARD.sub("симкарта", text.casefold().replace("ё", "е"))
+    aliases = {}
+    for word in WORD.findall(normalized):
+        if (len(word) < 3 and not word.isdecimal()) or word in STOP_WORDS:
+            continue
+        term = stem(word)
+        aliases.setdefault(term, {term}).update(tokens(expansions(word, strong_only=True)))
+    return aliases
+
+
 @dataclass(frozen=True)
 class SearchQuery:
     latest: str
@@ -97,6 +110,52 @@ class SearchQuery:
     def semantic_text(self):
         context = "\n".join(text for _, text in self.previous)
         return f"Контекст: {context}\nПоследний вопрос: {self.latest}" if context else self.latest
+
+
+DATA_REQUEST = re.compile(
+    r"\b(?:что\s+(?:вам\s+)?(?:нужн\w*|понадоб\w*|потреб\w*|необходим\w*)"
+    r"|каки\w*\s+(?:сведени\w*|данн\w*|документ\w*|параметр\w*|информаци\w*)"
+    r"\s+(?:(?:вам|надо|нужно)\s+)?"
+    r"(?:нужн\w*|понадоб\w*|потреб\w*|необходим\w*|подготов\w*|предостав\w*|собрать|прислать))",
+    re.I,
+)
+ESTIMATE_PURPOSE = re.compile(
+    r"\bдля\s+(?:(?:предварительн\w*|так\w*|ваш\w*|эт\w*)\s+)?"
+    r"(?:оценки|расч[её]та)(?:\s+(?:стоимости|проекта|подключения|объекта))?\s*[?.!]*\s*$",
+    re.I,
+)
+OTHER_INTENT = re.compile(r"\b(?:сколько|когда|почему|зачем|где|поч[её]м|срок\w*|хран\w*|персональн\w*)\b", re.I)
+REQUEST_PRODUCTS = (
+    ("солнечной станции", re.compile(r"солнечн\w*\s+(?:станц|панел|электростанц)|\bсэс\b", re.I)),
+    ("выхода на оптовый рынок", re.compile(r"оптов\w*\s+рын|\bорэм\b", re.I)),
+    ("платформы учёта", re.compile(
+        r"\bаскуэ\b|(?:автоматическ\w*|автоматизированн\w*|дистанционн\w*)\s+уч[её]т"
+        r"|платформ\w*\s+(?:для\s+)?уч[её]т|автоматиз\w*\s+сбор\s+показан", re.I)),
+    ("поиска коммерческих потерь", re.compile(
+        r"коммерческ\w*\s+потер|(?:поиск|найти|находить|выявлять)\s+(?:коммерческ\w*\s+)?потер", re.I)),
+    ("распознавания показаний", re.compile(
+        r"распознаван\w*\s+(?:показан|фотограф)|(?:показан\w*|сч[её]тчик\w*)\s+по\s+фото", re.I)),
+)
+
+
+def focus_data_request(latest, previous):
+    """Resolve one narrow follow-up without changing the client's actual message.
+
+    Only requests for the inputs to an estimate are rewritten. An explicit,
+    unambiguous product must occur in the user's own messages. Multiple products
+    or additional questions keep the original query and its context.
+    """
+    if (not previous or not DATA_REQUEST.search(latest) or not ESTIMATE_PURPOSE.search(latest)
+            or latest.count("?") > 1 or OTHER_INTENT.search(latest)):
+        return None
+    user_context = [text for role, text in previous if role in {"пользователь", "клиент", "user"}]
+    if not user_context:
+        return None
+    context = "\n".join([*user_context, latest])
+    products = [name for name, pattern in REQUEST_PRODUCTS if pattern.search(context)]
+    if len(products) != 1:
+        return None
+    return f"Какие сведения могут понадобиться для {products[0]}?"
 
 
 def prepare_query(question):
@@ -112,6 +171,21 @@ def prepare_query(question):
     if re.search(r"другой вопрос|сменим тему|теперь (?:про|о\b)", latest, re.I):
         return SearchQuery(latest, ())
     previous = tuple((role, text[-700:]) for role, text in turns[max(0, last - 4):last])
+    focused = focus_data_request(latest, previous)
+    if focused:
+        return SearchQuery(focused, ())
+    # A short value plus a suitability question contains no subject of its own.
+    # Restore it from user statements, without turning an assistant's guess
+    # into a customer fact. Explicit new topics fail this narrow vocabulary gate.
+    words = WORD.findall(latest.casefold().replace("ё", "е"))
+    value_word = re.compile(r"\d+(?:квт|мвт)?|полгода|полтора|полторы|один|одна|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять")
+    other_word = re.compile(r"год\w*|лет|месяц\w*|квт|мвт|всего|около|только|примерно|да|нет|этого|это|так|будет|достаточно|хватит|подойдет|можно|уже|нам|у|нас")
+    if (previous and 0 < len(words) <= 14 and any(value_word.fullmatch(w) for w in words)
+            and any(w in {"хватит", "достаточно", "подойдет"} for w in words)
+            and all(value_word.fullmatch(w) or other_word.fullmatch(w) for w in words)):
+        user_statements = [text for role, text in previous if role in {"пользователь", "клиент", "user"}]
+        if user_statements:
+            return SearchQuery("\n".join([*user_statements, latest]), previous)
     return SearchQuery(latest, previous)
 
 
@@ -130,12 +204,15 @@ class SearchIndex:
     need reevaluation on an independent labelled set when the corpus changes.
     """
 
-    def __init__(self, fragments, min_score=3.0, min_coverage=0.10, relative_cutoff=0.4):
+    def __init__(self, fragments, min_score=3.0, min_coverage=0.10, relative_cutoff=0.4, expansion_weight=0.7,
+                 k1=1.5, b=0.75, heading_boost=0.6, leaf_boost=1.0):
         if (not all(isfinite(v) for v in (min_score, min_coverage, relative_cutoff))
                 or min_score < 0 or not 0 <= min_coverage <= 1 or not 0 <= relative_cutoff <= 1):
             raise ValueError("Некорректные пороги поиска.")
         self.fragments = tuple(fragments)
         self.min_score, self.min_coverage, self.relative_cutoff = min_score, min_coverage, relative_cutoff
+        self.expansion_weight = expansion_weight
+        self.k1, self.b, self.heading_boost, self.leaf_boost = k1, b, heading_boost, leaf_boost
         self.counts = tuple(Counter(tokens(f.heading + "\n" + f.text)) for f in self.fragments)
         self.body_counts = tuple(Counter(tokens(f.text)) for f in self.fragments)
         self.heading_terms = tuple(set(tokens(f.heading)) for f in self.fragments)
@@ -149,40 +226,56 @@ class SearchIndex:
         self.unknown_idf = log1p((size + 0.5) / 0.5)
 
     def query_weights(self, query):
+        """Original terms (weight 1 for the latest turn, decaying for context) + thesaurus terms."""
         weights = {term: 1.0 for term in tokens(query.latest)}
         for position, (role, text) in enumerate(reversed(query.previous)):
             weight = (0.65 if role in {"пользователь", "клиент", "user"} else 0.18) * (0.9 ** position)
             for term in tokens(text):
                 weights[term] = max(weights.get(term, 0), weight)
-        return {term: weight * (0.35 if term.isdecimal() else 1) for term, weight in weights.items()}
+        original = set(weights)
+        if self.expansion_weight:
+            for term in tokens(expansions(query.latest)):
+                weights[term] = max(weights.get(term, 0), self.expansion_weight)
+            for role, text in query.previous:
+                if role in {"пользователь", "клиент", "user"}:
+                    for term in tokens(expansions(text)):
+                        weights[term] = max(weights.get(term, 0), self.expansion_weight * 0.5)
+        weights = {term: weight * (0.35 if term.isdecimal() else 1) for term, weight in weights.items()}
+        return weights, original
 
     def rank(self, question, limit=30, filter_relevance=True):
         if limit <= 0 or not self.fragments:
             return []
         query = prepare_query(question)
-        weights = self.query_weights(query)
+        weights, original = self.query_weights(query)
         if not weights:
             return []
-        denominator = sum(self.idf.get(term, self.unknown_idf) * weight for term, weight in weights.items())
-        latest = set(tokens(query.latest))
-        primary = {term for term in latest if not term.isdecimal()}
+        denominator = sum(self.idf.get(term, self.unknown_idf) * weights[term] for term in original) or 1.0
+        # An original query term counts as "covered" when it, or one of its strong thesaurus
+        # synonyms, occurs in the fragment. Weak synonyms only influence ranking.
+        aliases = term_aliases(query.latest)
+        for _, text in query.previous:
+            for term, alias in term_aliases(text).items():
+                aliases.setdefault(term, alias)
+        primary = {term for term in tokens(query.latest) if not term.isdecimal()}
+        useful_original = [t for t in original if not t.isdecimal()]
         hits = []
         for index, counter in enumerate(self.counts):
             matched = counter.keys() & weights.keys()
             if not matched:
                 continue
             # BM25 term-frequency saturation and document-length normalization.
-            norm = 1.5 * (1 - 0.5 + 0.5 * self.lengths[index] / self.average_length)
+            norm = self.k1 * (1 - self.b + self.b * self.lengths[index] / self.average_length)
             body = self.body_counts[index]
             score = sum(self.idf[term] * weights[term] * (
-                body[term] * 2.5 / (body[term] + norm)
-                + 0.6 * (term in self.heading_terms[index])
-                + 1.4 * (term in self.leaf_terms[index])
+                body[term] * (self.k1 + 1) / (body[term] + norm)
+                + self.heading_boost * (term in self.heading_terms[index])
+                + self.leaf_boost * (term in self.leaf_terms[index])
             ) for term in sorted(matched))
-            coverage = sum(self.idf[term] * weights[term] for term in sorted(matched)) / denominator
-            useful_matches = {term for term in matched if not term.isdecimal()}
-            enough_terms = len(useful_matches) >= min(2, len([t for t in weights if not t.isdecimal()]))
-            latest_match = not primary or bool(primary & matched)
+            covered = {t for t in original if aliases.get(t, {t}) & counter.keys()}
+            coverage = sum(self.idf.get(t, self.unknown_idf) * weights[t] for t in covered) / denominator
+            enough_terms = len([t for t in covered if not t.isdecimal()]) >= min(2, len(useful_original))
+            latest_match = not primary or bool(primary & covered)
             if filter_relevance and (score < self.min_score or coverage < self.min_coverage or not enough_terms or not latest_match):
                 continue
             hits.append(SearchHit(index, self.fragments[index], score, coverage))

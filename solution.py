@@ -9,8 +9,10 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from ask_kb import ModelSettings, generate_answer
-from search_kb import SearchIndex, parse_document
+from consultant import Consultant, parse_dialog
+from llm_client import Client, Settings
+from retrieval import HybridRetriever
+from search_kb import parse_document
 
 
 SERVICE_ERROR = (
@@ -99,20 +101,30 @@ def run(directory):
     kb_path = find_input(directory, "knowledge-base.zip", "knowledge_base.zip", "kb.zip")
     questions = read_questions(questions_path)
     fragments = read_knowledge_base(kb_path)
-    search_index = SearchIndex(fragments)
-    settings = ModelSettings.from_environment()
+    settings = Settings.from_environment()
+    if not settings.has_llm:
+        raise ValueError("Задайте LLM_BASE_URL, LLM_API_KEY и LLM_MODEL.")
+    client = Client(settings)
+    retriever = HybridRetriever(fragments, client)
+    consultant = Consultant(retriever, client)
     workers = positive_setting("MAX_WORKERS", 3, 8)
-    top_k = positive_setting("TOP_K", 3, 12)
+    print(f"Поиск: {retriever.mode}.", flush=True)
 
     def answer_question(question):
-        if not question.strip():
-            return "Опишите, пожалуйста, какую задачу вы хотите решить с помощью Energytool."
-        sources = search_index.find(question, limit=top_k)
-        return generate_answer(question, sources, settings)
+        history, message = parse_dialog(question)
+        if not message.strip():
+            return "Опишите, пожалуйста, какую задачу вы хотите решить с помощью Energytool.", "empty", False
+        result = consultant.answer(history, message)
+        if result.debug.get("generation") != "llm":
+            # Keep an extractive answer instead of an error text, but report the failure.
+            print(f"LLM недоступна: {result.debug.get('llm_error')}", file=sys.stderr)
+        return result.text, result.debug.get("generation", "unknown"), bool(result.debug.get("llm_retry"))
 
     print(f"Вопросов: {len(questions)}. Фрагментов базы: {len(fragments)}.", flush=True)
     answers = [None] * len(questions)
     failures = 0
+    generations = {}
+    retried = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = {
             pool.submit(answer_question, question): index
@@ -121,13 +133,17 @@ def run(directory):
         for future in as_completed(pending):
             index = pending[future]
             try:
-                answers[index] = future.result()
+                answers[index], generation, was_retried = future.result()
+                generations[generation] = generations.get(generation, 0) + 1
+                retried += int(was_retried)
             except (RuntimeError, OSError, ValueError) as error:
                 failures += 1
                 answers[index] = SERVICE_ERROR
                 print(f"Ошибка сервиса для строки {index + 1}: {error}", file=sys.stderr)
     output = write_submission(questions, answers)
     print(f"Создан {output.name}. Ответов: {len(answers)}. Ошибок сервиса: {failures}.")
+    print(f"Ответов LLM: {generations.get('llm', 0)}. Запасных ответов: {generations.get('fallback', 0)}. "
+          f"Повторов неполной генерации: {retried}.")
 
 
 def main():

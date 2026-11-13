@@ -5,7 +5,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-FILES = ("solution.py", "search_kb.py", "russian_stemmer.py", "ask_kb.py", "requirements.txt")
+FILES = (
+    "solution.py", "consultant.py", "retrieval.py", "llm_client.py",
+    "search_kb.py", "thesaurus.py", "russian_stemmer.py", "context_builder.py", "requirements.txt",
+)
 
 
 def main():
