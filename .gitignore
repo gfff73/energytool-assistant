@@ -1,3 +1,7 @@
 materials/
 tmp/
 .env
+__pycache__/
+*.pyc
+dist/
+submission.csv
